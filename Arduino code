@@ -1,0 +1,240 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+#include <ArduinoJson.h>
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+#include <DHT.h>
+
+// ===================================================
+// ---------------- Wi-Fi credentials ----------------
+const char* ssid     = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+// ===================================================
+// ---------------- Rover (Accelerometer) ----------------
+const char* serverURL = "http://192.168.71.206/sensor";  // SIWG917 accelerometer server
+WiFiClient rover_client;
+HTTPClient http;
+
+// Motor driver pins (L298N)
+int enA = D1;
+int in1 = D2;
+int in2 = D3;
+int in3 = D4;
+int in4 = D5;
+int enB = D6;
+
+// Rover extra features
+const int ledPin = D8;       // LED
+const int wifiLedPin = D0;   // WiFi status LED
+
+int SPEED = 1023;          // Motor speed
+int speed_Coeff = 3;       // Turning sharpness
+
+// ===================================================
+// ---------------- DHT11 + Gas + Telegram + ThingSpeak ----------------
+#define DHTPIN D4        // ⚠ Conflict with in3 (choose another pin like D9 if available)
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+#define GAS_PIN A0       // MQ gas sensor
+
+// Telegram
+#define BOTtoken "YOUR_TELEGRAM_BOT_TOKEN"
+#define CHAT_ID "YOUR_CHAT_ID"
+
+// ThingSpeak
+String apiKey = "YOUR_THINGSPEAK_API_KEY";
+const char* ts_server = "api.thingspeak.com";
+
+// Clients
+WiFiClientSecure tg_client;          // For Telegram
+WiFiClient thingspeak_client;        // For ThingSpeak
+UniversalTelegramBot bot(BOTtoken, tg_client);
+
+unsigned long lastTimeBotRan;
+const int botRequestDelay = 2000;
+
+// ===================================================
+// ---------------- Setup ----------------
+void setup() {
+  Serial.begin(115200);
+
+  // Motor pin setup
+  pinMode(enA, OUTPUT); pinMode(in1, OUTPUT); pinMode(in2, OUTPUT);
+  pinMode(in3, OUTPUT); pinMode(in4, OUTPUT); pinMode(enB, OUTPUT);
+  pinMode(ledPin, OUTPUT); pinMode(wifiLedPin, OUTPUT);
+
+  digitalWrite(ledPin, LOW);
+  digitalWrite(wifiLedPin, HIGH);
+
+  analogWrite(enA, SPEED);
+  analogWrite(enB, SPEED);
+
+  // Connect Wi-Fi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500); Serial.print(".");
+  }
+  Serial.println("\n✅ Connected to Wi-Fi!");
+  digitalWrite(wifiLedPin, LOW);
+
+  // DHT init
+  dht.begin();
+
+  // Telegram SSL
+  tg_client.setInsecure(); // ignore SSL cert
+}
+
+// ===================================================
+// ---------------- Rover Movement ----------------
+void Forward() {
+  analogWrite(enA, SPEED); analogWrite(enB, SPEED);
+  digitalWrite(in1, HIGH); digitalWrite(in2, LOW);
+  digitalWrite(in3, HIGH); digitalWrite(in4, LOW);
+  Serial.println("Moving Forward");
+}
+void Backward() {
+  analogWrite(enA, SPEED); analogWrite(enB, SPEED);
+  digitalWrite(in1, LOW); digitalWrite(in2, HIGH);
+  digitalWrite(in3, LOW); digitalWrite(in4, HIGH);
+  Serial.println("Moving Backward");
+}
+void TurnLeft() {
+  analogWrite(enA, SPEED / speed_Coeff); analogWrite(enB, SPEED);
+  digitalWrite(in1, HIGH); digitalWrite(in2, LOW);
+  digitalWrite(in3, LOW); digitalWrite(in4, HIGH);
+  Serial.println("Turning Left");
+}
+void TurnRight() {
+  analogWrite(enA, SPEED); analogWrite(enB, SPEED / speed_Coeff);
+  digitalWrite(in1, LOW); digitalWrite(in2, HIGH);
+  digitalWrite(in3, HIGH); digitalWrite(in4, LOW);
+  Serial.println("Turning Right");
+}
+void Stop() {
+  analogWrite(enA, 0); analogWrite(enB, 0);
+  digitalWrite(in1, LOW); digitalWrite(in2, LOW);
+  digitalWrite(in3, LOW); digitalWrite(in4, LOW);
+  Serial.println("Stopped");
+}
+
+// ===================================================
+// ---------------- ThingSpeak ----------------
+void sendToThingSpeak(float temp, float hum, int gas) {
+  if (thingspeak_client.connect(ts_server, 80)) {
+    String postStr = apiKey;
+    postStr += "&field1=" + String(temp);
+    postStr += "&field2=" + String(gas);
+    postStr += "&field3=" + String(hum);
+    postStr += "\r\n\r\n";
+
+    thingspeak_client.print("POST /update HTTP/1.1\n");
+    thingspeak_client.print("Host: api.thingspeak.com\n");
+    thingspeak_client.print("Connection: close\n");
+    thingspeak_client.print("X-THINGSPEAKAPIKEY: " + apiKey + "\n");
+    thingspeak_client.print("Content-Type: application/x-www-form-urlencoded\n");
+    thingspeak_client.print("Content-Length: "); thingspeak_client.print(postStr.length());
+    thingspeak_client.print("\n\n");
+    thingspeak_client.print(postStr);
+
+    Serial.println("✅ Data sent to ThingSpeak!");
+  } else {
+    Serial.println("❌ ThingSpeak connection failed!");
+  }
+}
+
+// ===================================================
+// ---------------- Telegram ----------------
+void handleNewMessages(int numNewMessages) {
+  for (int i = 0; i < numNewMessages; i++) {
+    String chat_id = String(bot.messages[i].chat_id);
+    String text = bot.messages[i].text;
+
+    if (chat_id != CHAT_ID) {
+      bot.sendMessage(chat_id, "Unauthorized user", "");
+      continue;
+    }
+
+    if (text == "/get") {
+      float temperature = dht.readTemperature();
+      float humidity = dht.readHumidity();
+      int gasValue = analogRead(GAS_PIN);
+
+      if (isnan(temperature) || isnan(humidity)) {
+        bot.sendMessage(CHAT_ID, "❌ Failed to read from DHT sensor!", "");
+        return;
+      }
+
+      Serial.printf("🌡 Temp: %.2f °C | 💧 Hum: %.2f %% | 🟢 Gas: %d\n", temperature, humidity, gasValue);
+
+      String message = "🌡 Temp: " + String(temperature) + " °C\n";
+      message += "💧 Humidity: " + String(humidity) + " %\n";
+      message += "🟢 Gas: " + String(gasValue);
+      bot.sendMessage(CHAT_ID, message, "");
+
+      sendToThingSpeak(temperature, humidity, gasValue);
+    }
+  }
+}
+
+// ===================================================
+// ---------------- Loop ----------------
+void loop() {
+  delay(10);
+
+  // -------- Rover fetch accelerometer data --------
+  if (WiFi.status() == WL_CONNECTED) {
+    http.begin(rover_client, serverURL);  
+    int httpCode = http.GET();
+
+    if (httpCode > 0) {
+      String payload = http.getString();
+      Serial.println("Server response:");
+      Serial.println(payload);
+
+      StaticJsonDocument<256> doc;
+      DeserializationError error = deserializeJson(doc, payload);
+
+      if (!error) {
+        float accelX = doc["ax"];
+        float accelY = doc["ay"];
+
+        Serial.printf("AccelX: %.2f, AccelY: %.2f\n", accelX, accelY);
+
+        if (accelX < -0.35 && accelX > -0.5) {
+          Backward();
+        } else if (accelX < 0.6 && accelX > 0.35) {
+          Forward();
+        } else if (accelY > -0.6 && accelY < -0.35) {
+          TurnRight();
+        } else if (accelY < 0.6 && accelY > 0.35) {
+          TurnLeft();
+        } else {
+          Stop();
+        }
+      } else {
+        Serial.println("JSON parse failed!");
+      }
+    } else {
+      Serial.printf("GET request failed, error: %s\n", http.errorToString(httpCode).c_str());
+    }
+    http.end(); 
+  } else {
+    Serial.println("Wi-Fi disconnected!");
+    digitalWrite(wifiLedPin, HIGH);
+  }
+
+  // -------- Telegram bot handling --------
+  if (millis() - lastTimeBotRan > botRequestDelay) {
+    int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+    while (numNewMessages) {
+      handleNewMessages(numNewMessages);
+      numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+    }
+    lastTimeBotRan = millis();
+  }
+
+  delay(2000);
+}
