@@ -7,8 +7,7 @@ This project integrates **Silicon Labs SIWG917** to build an IoT system that str
 - **Rover** functions as a **Wi-Fi client**, fetching the data from SIWG917 and printing it to the console.  
 
 ## ⚙️ Features
-- Real-time **acceleration, and gyro data** via HTTP server.  
-- ESP8266 parses server response and **prints values to Serial Monitor**.  
+- Real-time **acceleration, and gyro data** via HTTP server.   
 - **Rover control** (forward, backward, left, right) based on accelerometer values.  
 - Wi-Fi based communication between SIWG917 and ESP8266.  
 
